@@ -6,16 +6,16 @@ from activity_reporter import create_reporter
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-MONGODB_URI = os.getenv("MONGODB_URI")  # שים ב-Render → Environment
+MONGODB_URI = os.getenv("MONGODB_URI")
 reporter = create_reporter(
     mongodb_uri=MONGODB_URI,
     service_id="srv-d2sbg924d50c73as1ku0",
     service_name="Cursor-Check"
 )
 
-# --- NEW: seed ראשוני כדי שהשירות יופיע בבוט ההשעיה ---
+# --- seed ראשוני: שהשירות יופיע מיד בבוט ההשעיה ---
 try:
-    reporter.report_activity("system:init")
+    reporter.report_service_heartbeat()
 except Exception:
     pass
 
@@ -31,7 +31,9 @@ def send(text: str, user_id: str = None):
             timeout=10,
         )
         if user_id:
-            reporter.report_activity(user_id)  # רושם פעילות
+            # אם תרצה לרשום גם אינטראקציה של "משתמש־מערכת":
+            # reporter.report_activity(user_id)
+            pass
     except Exception:
         pass
 
@@ -47,23 +49,26 @@ def check_cursor_ai() -> bool:
         return False
 
 if __name__ == "__main__":
-    send("🤖 cursor-monitor started", user_id="monitor")
+    send("🤖 cursor-monitor started")
     while True:
         status = check_cursor_ai()
 
-        # שולח התראה רק אם היה שינוי מצב
         if status != last_status:
-            send("✅ Cursor AI is RESPONDING" if status else "❌ Cursor AI is NOT responding",
-                 user_id="monitor")
+            send("✅ Cursor AI is RESPONDING" if status else "❌ Cursor AI is NOT responding")
             last_status = status
+            # אפשר גם לעדכן heartbeat בעת שינוי סטטוס:
+            try:
+                reporter.report_service_heartbeat()
+            except Exception:
+                pass
 
-        # --- NEW: heartbeat תקופתי כל 30 דק׳ ---
+        # heartbeat תקופתי כל 30 דק׳
         tick += 1
         if tick >= HEARTBEAT_EVERY_MIN:
             try:
-                reporter.report_activity("system:heartbeat")
+                reporter.report_service_heartbeat()
             except Exception:
                 pass
             tick = 0
 
-        time.sleep(60)  # בדיקה כל דקה
+        time.sleep(60)
