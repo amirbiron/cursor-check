@@ -13,12 +13,7 @@ def check_cursor_ai():
     try:
         url = "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools"
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "messages": [
-                {"role": "user", "content": "ping"}
-            ],
-            "model": "gpt-4",
-        }
+        payload = {"messages": [{"role": "user", "content": "ping"}], "model": "gpt-4"}
         r = requests.post(url, json=payload, timeout=10)
         return r.status_code == 200
     except Exception:
@@ -32,4 +27,4 @@ while True:
         else:
             bot.send_message(chat_id=CHAT_ID, text="❌ Cursor AI is NOT responding")
         last_status = status
-    time.sleep(300)  # כל 5 דקות
+    time.sleep(300)
