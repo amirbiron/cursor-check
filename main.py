@@ -28,7 +28,6 @@ def check_cursor_ai():
 
 while True:
     status = check_cursor_ai()
-    global last_status
     if status != last_status:
         if status:
             bot.send_message(chat_id=CHAT_ID, text="✅ Cursor AI is RESPONDING")
