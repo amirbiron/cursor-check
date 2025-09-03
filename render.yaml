@@ -1,8 +1,8 @@
 services:
   - type: worker
-    name: cursor-monitor-pro
+    name: cursor-monitor
     env: python
-    plan: free
+    plan: starter    # Worker דורש Starter plan. אם אתה רוצה להריץ ב-Free, צריך להפוך ל-Web Service
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     envVars:
