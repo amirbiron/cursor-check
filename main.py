@@ -12,9 +12,7 @@ last_status = None
 def check_cursor_ai():
     try:
         url = "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools"
-        headers = {
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
         payload = {
             "messages": [
                 {"role": "user", "content": "ping"}
