@@ -30,7 +30,7 @@ def check_cursor_ai() -> bool:
         return False
 
 if __name__ == "__main__":
-    global last_status
+
     while True:
         status = check_cursor_ai()
         if status != last_status:
