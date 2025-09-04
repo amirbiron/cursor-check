@@ -1,5 +1,6 @@
 # status_watcher.py
-# Watch Cursor (or any Statuspage-style) RSS/Atom feed and push concise Hebrew updates.
+# Watch Statuspage-style RSS/Atom feed and push concise Hebrew updates.
+# Sends only the *latest* relevant item when STATUS_ONLY_LATEST=true.
 
 import os
 import time
@@ -10,20 +11,23 @@ import requests
 import xml.etree.ElementTree as ET
 
 # ===== ENV & Defaults =====
-DEFAULT_FEED_URL = os.getenv("STATUS_FEED_URL", "").strip()
-POLL_SEC         = int(os.getenv("STATUS_POLL_SEC", "180"))
-STATE_PATH       = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
+DEFAULT_FEED_URL       = os.getenv("STATUS_FEED_URL", "").strip()
+POLL_SEC               = int(os.getenv("STATUS_POLL_SEC", "180"))
+STATE_PATH             = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
 
-ONLY_INCIDENTLIKE    = os.getenv("STATUS_ONLY_INCIDENTS", "true").lower() == "true"
-SKIP_ANALYTICS       = os.getenv("STATUS_SKIP_ANALYTICS", "true").lower() == "true"
-MAX_PER_POLL         = int(os.getenv("STATUS_MAX_PER_POLL", "2"))
-COOLDOWN_SEC         = int(os.getenv("STATUS_COOLDOWN_SEC", "900"))
-BOOT_IGNORE_HISTORY  = os.getenv("STATUS_BOOT_IGNORE_HISTORY", "true").lower() == "true"
-SEND_LAST_ON_BOOT    = os.getenv("STATUS_SEND_LAST_ON_BOOT", "true").lower() == "true"
+ONLY_INCIDENTLIKE      = os.getenv("STATUS_ONLY_INCIDENTS", "true").lower() == "true"
+SKIP_ANALYTICS         = os.getenv("STATUS_SKIP_ANALYTICS", "true").lower() == "true"
+MAX_PER_POLL           = int(os.getenv("STATUS_MAX_PER_POLL", "2"))
+COOLDOWN_SEC           = int(os.getenv("STATUS_COOLDOWN_SEC", "900"))
+BOOT_IGNORE_HISTORY    = os.getenv("STATUS_BOOT_IGNORE_HISTORY", "true").lower() == "true"
+SEND_LAST_ON_BOOT      = os.getenv("STATUS_SEND_LAST_ON_BOOT", "true").lower() == "true"
+
+# חדש: שלח רק את הפריט העדכני ביותר בכל סבב
+ONLY_LATEST            = os.getenv("STATUS_ONLY_LATEST", "true").lower() == "true"
 
 # תצוגה בעברית – קצר וברור
-STATUS_HEBREW        = os.getenv("STATUS_HEBREW", "true").lower() == "true"
-STATUS_TZ            = os.getenv("STATUS_TZ", "Asia/Jerusalem")
+STATUS_HEBREW          = os.getenv("STATUS_HEBREW", "true").lower() == "true"
+STATUS_TZ              = os.getenv("STATUS_TZ", "Asia/Jerusalem")
 # לכל מקרה שתרצה כן לכלול תקציר טקסט חופשי:
 STATUS_INCLUDE_SUMMARY = os.getenv("STATUS_INCLUDE_SUMMARY", "false").lower() == "true"
 
@@ -194,7 +198,6 @@ def _format_msg(item: Dict[str, Any]) -> str:
             f"🔗 {link}" if link else "",
         ]
         if STATUS_INCLUDE_SUMMARY and summary:
-            # אופציונלי – אם תרצה גם שורה קצרה מתוכן ההודעה
             short = summary.strip()
             if len(short) > 240:
                 short = short[:237] + "..."
@@ -269,6 +272,7 @@ def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], N
         state["last_ids"] = last_ids
         return state
 
+    # פריטים חדשים ביחס ל-state
     fresh: List[Dict[str, Any]] = []
     for it in items:
         it_id = it.get("id") or ""
@@ -285,24 +289,39 @@ def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], N
             continue
         fresh.append(it)
 
-    fresh.sort(key=lambda x: x.get("updated_ts", now))
-
-    sent = 0
-    for it in fresh:
-        if sent >= MAX_PER_POLL:
-            break
-        if COOLDOWN_SEC > 0 and (now - last_sent_ts) < COOLDOWN_SEC:
-            break
-        try:
-            on_event(_format_msg(it))
-            last_sent_ts = now
-            sent += 1
-        except Exception:
-            pass
-        finally:
+    if ONLY_LATEST and fresh:
+        # שלח רק את הפריט העדכני ביותר
+        latest = max(fresh, key=lambda x: x.get("updated_ts", 0.0))
+        if COOLDOWN_SEC <= 0 or (now - last_sent_ts) >= COOLDOWN_SEC:
+            try:
+                on_event(_format_msg(latest))
+                last_sent_ts = now
+            except Exception:
+                pass
+        # סמון כל החדשים כ"נצפו" כדי שלא נצבור backlog
+        for it in fresh:
             _id = it.get("id")
-            if _id:
+            if _id and _id not in last_ids:
                 last_ids.append(_id)
+    else:
+        # התנהגות ישנה – עד MAX_PER_POLL ובהתחשב ב-cooldown
+        fresh.sort(key=lambda x: x.get("updated_ts", now))
+        sent = 0
+        for it in fresh:
+            if sent >= MAX_PER_POLL:
+                break
+            if COOLDOWN_SEC > 0 and (now - last_sent_ts) < COOLDOWN_SEC:
+                break
+            try:
+                on_event(_format_msg(it))
+                last_sent_ts = now
+                sent += 1
+            except Exception:
+                pass
+            finally:
+                _id = it.get("id")
+                if _id:
+                    last_ids.append(_id)
 
     if len(last_ids) > 200:
         last_ids = last_ids[-200:]
@@ -333,7 +352,7 @@ def start_status_watcher(
             f"only_incidents={ONLY_INCIDENTLIKE}, skip_analytics={SKIP_ANALYTICS}, "
             f"cooldown={COOLDOWN_SEC}s, max_per_poll={MAX_PER_POLL}, "
             f"boot_ignore_history={BOOT_IGNORE_HISTORY}, send_last_on_boot={SEND_LAST_ON_BOOT}, "
-            f"hebrew={STATUS_HEBREW}, include_summary={STATUS_INCLUDE_SUMMARY}",
+            f"only_latest={ONLY_LATEST}, hebrew={STATUS_HEBREW}, include_summary={STATUS_INCLUDE_SUMMARY}",
             flush=True,
         )
         while True:
