@@ -1,22 +1,25 @@
 import os
 import time
 import threading
+from collections import deque
 import requests
 from activity_reporter import create_reporter
 
-# === Environment ===
+# ========= ENV =========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 MONGODB_URI = os.getenv("MONGODB_URI")
 SERVICE_ID = os.getenv("SERVICE_ID", "srv-unknown")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Cursor-Check")
-SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")
+SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # user id מספרי שלך
 
-# פרמטרים לניטור יציב
-SUCCESS_STREAK_MIN = int(os.getenv("SUCCESS_STREAK_MIN", "5"))     # כמה הצלחות רצופות נדרשות
-STABLE_WINDOW_SEC  = int(os.getenv("STABLE_WINDOW_SEC",  "300"))   # כמה זמן (שניות) נדרשות ליציבות
+# פרמטרים לניטור (ניתן לשנות ב-ENV)
+SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))  # כל כמה שניות לדגום
+BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))          # מינ' הצלחות רצופות ל"חזר"
+BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))      # חלון יציבות (שניות) ל"חזר" (ברירת מחדל 10 דק')
+DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))         # מינ' כשלונות רצופים ל"נפל"
 
-# === Reporter init ===
+# ========= Reporter init =========
 reporter = None
 if MONGODB_URI:
     try:
@@ -30,11 +33,11 @@ else:
     print("ℹ️ MONGODB_URI not set – activity reporting disabled", flush=True)
 
 last_status = None
-running = True
+running = True  # נשלט ע״י /pause ו-/resume
 
 
 def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> None:
-    """שליחת הודעה לטלגרם + דיווח activity"""
+    """שליחת הודעה לטלגרם + דיווח activity (best-effort)."""
     target = chat_id or CHAT_ID
     if not TOKEN or not target:
         return
@@ -54,40 +57,63 @@ def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> N
 
 
 def check_cursor_ai() -> bool:
+    """בודק שה-API של Cursor מחזיר 200 וגם יש תוכן; לא סופר 200 ריק."""
     try:
         r = requests.post(
             "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
             json={"messages": [{"role": "user", "content": "ping"}], "model": "gpt-4"},
-            timeout=10,
+            timeout=12,
         )
-        return r.status_code == 200
+        if r.status_code != 200:
+            return False
+        body = (r.text or "")[:200].lower()
+        return len(body) > 5
     except Exception:
         return False
 
 
 def check_site_ok() -> bool:
+    """בודק שהדף הראשי חי ולא 200 של דף שגיאה ריק/גנרי."""
     try:
         r = requests.get("https://cursor.sh", timeout=10)
-        return r.status_code == 200
+        if r.status_code != 200:
+            return False
+        txt = (r.text or "")[:400].lower()
+        return "cursor" in txt or "<title" in txt
     except Exception:
         return False
 
 
 def monitor_loop() -> None:
-    """ניטור: שולח התראה רק אחרי רצף הצלחות + חלון זמן"""
+    """
+    נחשב 'עלה' רק אם גם ה-AI וגם האתר OK (AND), וגם:
+      - יש רצף של BACK_SUCC_MIN הצלחות
+      - והן פרושות על לפחות BACK_WINDOW_SEC שניות (חלון יציבות)
+    'נפל' רק אחרי DOWN_FAILS_MIN כשלונות רצופים.
+    """
     global last_status, running
     send("🤖 cursor-monitor started", user_id="monitor")
 
+    history: deque[tuple[float, bool]] = deque()
     ok_streak = 0
     fail_streak = 0
-    first_ok_ts = None
+    first_ok_ts: float | None = None
 
     while True:
         if running:
-            status = check_cursor_ai() or check_site_ok()
+            ai_ok = check_cursor_ai()
+            web_ok = check_site_ok()
+            ok_both = ai_ok and web_ok
             now = time.time()
 
-            if status:
+            # היסטוריה לחלון זמן (למרות שהרצף הוא קריטריון עיקרי)
+            history.append((now, ok_both))
+            cutoff = now - BACK_WINDOW_SEC
+            while history and history[0][0] < cutoff:
+                history.popleft()
+
+            # עדכון רצפים
+            if ok_both:
                 if ok_streak == 0:
                     first_ok_ts = now
                 ok_streak += 1
@@ -97,26 +123,26 @@ def monitor_loop() -> None:
                 first_ok_ts = None
                 fail_streak += 1
 
-            # ❌ נפל – מאשרים רק אחרי 2 כשלונות
-            if last_status is not False and fail_streak >= 2:
-                send("❌ Cursor seems down (2/2 checks failed)", user_id="monitor")
+            # ❌ נפל: רצף כשלונות
+            if last_status is not False and fail_streak >= DOWN_FAILS_MIN:
+                send(f"❌ Cursor down ({DOWN_FAILS_MIN}/{DOWN_FAILS_MIN} fails)", user_id="monitor")
                 last_status = False
 
-            # ✅ חזר – חייב רצף וגם חלון זמן
+            # ✅ חזר: רצף הצלחות + חלון זמן
             if (
                 last_status is not True
-                and ok_streak >= SUCCESS_STREAK_MIN
+                and ok_streak >= BACK_SUCC_MIN
                 and first_ok_ts is not None
-                and (now - first_ok_ts) >= STABLE_WINDOW_SEC
+                and (now - first_ok_ts) >= BACK_WINDOW_SEC
             ):
+                mins = BACK_WINDOW_SEC // 60
                 send(
-                    f"✅ Cursor looks back "
-                    f"({ok_streak}/{SUCCESS_STREAK_MIN} over ≥{STABLE_WINDOW_SEC//60}m)",
+                    f"✅ Cursor back ({ok_streak}/{BACK_SUCC_MIN} over ≥{mins}m, AND check)",
                     user_id="monitor",
                 )
                 last_status = True
 
-        time.sleep(60)
+        time.sleep(SAMPLE_INTERVAL_SEC)
 
 
 def polling_loop() -> None:
@@ -124,6 +150,7 @@ def polling_loop() -> None:
     global running
     offset = None
 
+    # מנקה webhook כדי ש-getUpdates יעבוד
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
@@ -170,19 +197,24 @@ def polling_loop() -> None:
                     if last_status is None:
                         send("ℹ️ No checks yet", chat_id=chat_id, user_id=user_id)
                     else:
-                        send("✅ Responding" if last_status else "❌ Not responding",
-                             chat_id=chat_id, user_id=user_id)
+                        send(
+                            "✅ Responding" if last_status else "❌ Not responding",
+                            chat_id=chat_id,
+                            user_id=user_id,
+                        )
         except Exception:
             time.sleep(3)
 
 
 if __name__ == "__main__":
+    # דיווח פתיחה כדי שבוט ההשעיה יזהה מיידית
     if reporter and SUSPENSION_USER_ID:
         try:
             reporter.report_activity(SUSPENSION_USER_ID)
         except Exception:
             pass
 
+    # מריץ ניטור + קליטת פקודות במקביל
     threading.Thread(target=monitor_loop, daemon=True).start()
     print("👂 polling_loop started", flush=True)
     polling_loop()
