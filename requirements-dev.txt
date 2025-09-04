@@ -1,0 +1,5 @@
+black==24.8.0
+flake8==7.1.1
+mypy==1.11.1
+types-requests==2.31.0.20240218
+bandit==1.7.9
