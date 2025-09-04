@@ -4,7 +4,7 @@ import threading
 from collections import deque
 import requests
 from activity_reporter import create_reporter
-from status_watcher import start_status_watcher  # ← NEW
+from status_watcher import start_status_watcher  # watcher לרסס
 
 # ========= ENV =========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -14,16 +14,19 @@ SERVICE_ID = os.getenv("SERVICE_ID", "srv-unknown")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Cursor-Check")
 SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # user id מספרי שלך
 
-# פרמטרים לניטור (ניתן לשנות ב-ENV)
-SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))  # כל כמה שניות לדגום
-BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))          # מינ' הצלחות רצופות ל"חזר"
-BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))      # חלון יציבות ל"חזר" (שניות)
-DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))         # מינ' כשלונות רצופים ל"נפל"
+# פרמטרים לניטור
+SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
+BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))
+BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))
+DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))
 
 # ======== Status feed watcher (ENV) ========
 STATUS_FEED_URL    = os.getenv("STATUS_FEED_URL", "").strip()      # למשל: https://status.cursor.com/history.atom
 STATUS_POLL_SEC    = int(os.getenv("STATUS_POLL_SEC", "180"))
 STATUS_STATE_PATH  = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
+
+last_status = None
+running = True  # נשלט ע״י /pause ו-/resume
 
 # ========= Reporter init =========
 reporter = None
@@ -37,9 +40,6 @@ if MONGODB_URI:
         print(f"❗ activity_reporter init failed: {e}", flush=True)
 else:
     print("ℹ️ MONGODB_URI not set – activity reporting disabled", flush=True)
-
-last_status = None
-running = True  # נשלט ע״י /pause ו-/resume
 
 
 def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> None:
@@ -63,7 +63,7 @@ def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> N
 
 
 def check_cursor_ai() -> bool:
-    """בודק שה-API של Cursor מחזיר 200 וגם יש תוכן; לא סופר 200 ריק."""
+    """בודק שה-API של Cursor מחזיר 200 ויש גוף תשובה."""
     try:
         r = requests.post(
             "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
@@ -72,14 +72,13 @@ def check_cursor_ai() -> bool:
         )
         if r.status_code != 200:
             return False
-        body = (r.text or "")
-        return len(body) > 5
+        return len((r.text or "")) > 5
     except Exception:
         return False
 
 
 def check_site_ok() -> bool:
-    """אתר חי = 200 (מרוכך כדי לא לסמן DOWN על placeholder)."""
+    """בודק שהאתר הראשי מחזיר 200 (מרוכך כדי להימנע מ-False DOWN)."""
     try:
         r = requests.get("https://cursor.sh", timeout=10)
         return r.status_code == 200
@@ -89,10 +88,10 @@ def check_site_ok() -> bool:
 
 def monitor_loop() -> None:
     """
-    'עלה' רק אם גם ה-AI וגם האתר OK (AND), וגם:
+    'עלה' = גם ה-AI וגם האתר OK (AND), וגם:
       - רצף של BACK_SUCC_MIN הצלחות
-      - לאורך לפחות BACK_WINDOW_SEC שניות (חלון יציבות)
-    'נפל' רק אחרי DOWN_FAILS_MIN כשלונות רצופים.
+      - לפחות BACK_WINDOW_SEC שניות יציבות.
+    'נפל' = אחרי DOWN_FAILS_MIN כשלונות רצופים.
     """
     global last_status, running
     send("🤖 cursor-monitor started", user_id="monitor")
@@ -141,7 +140,7 @@ def monitor_loop() -> None:
 
 
 def polling_loop() -> None:
-    """פקודות טלגרם: /pause /resume /status /now"""
+    """פקודות טלגרם: /pause /resume /status /now /last"""
     global running
     offset = None
 
@@ -168,7 +167,7 @@ def polling_loop() -> None:
                 continue
 
             for upd in data.get("result", []):
-                # חשוב: לשרוף את ה-update כדי שלא יחזור שוב
+                # 🔑 מוודא שהודעה לא תחזור שוב:
                 offset = upd["update_id"] + 1
 
                 msg = upd.get("message") or {}
@@ -178,6 +177,7 @@ def polling_loop() -> None:
                 user_id = str(user.get("id")) if user.get("id") else None
                 text = (msg.get("text") or "").strip()
 
+                # דיווח פעילות לכל הודעה נכנסת (אם יש reporter)
                 if reporter:
                     try:
                         reporter.report_activity(user_id or (str(chat_id) if chat_id else None))
@@ -187,9 +187,11 @@ def polling_loop() -> None:
                 if text == "/pause":
                     running = False
                     send("⏸️ Monitoring paused", chat_id=chat_id, user_id=user_id)
+
                 elif text == "/resume":
                     running = True
                     send("▶️ Monitoring resumed", chat_id=chat_id, user_id=user_id)
+
                 elif text == "/status":
                     if last_status is None:
                         send("ℹ️ No checks yet", chat_id=chat_id, user_id=user_id)
@@ -199,6 +201,7 @@ def polling_loop() -> None:
                             chat_id=chat_id,
                             user_id=user_id,
                         )
+
                 elif text == "/now":
                     ai_ok = check_cursor_ai()
                     web_ok = check_site_ok()
@@ -210,6 +213,26 @@ def polling_loop() -> None:
                         f"• AND:  {'OK' if both else 'DOWN'}"
                     )
                     send(msg_now, chat_id=chat_id, user_id=user_id)
+
+                elif text == "/last":
+                    try:
+                        # נשתמש בפונקציות מהצופה כדי להביא ולפרמט
+                        from status_watcher import _fetch_feed, _format_msg
+                        feed = STATUS_FEED_URL or ""
+                        if not feed:
+                            send("📡 אין STATUS_FEED_URL מוגדר", chat_id=chat_id, user_id=user_id)
+                        else:
+                            items = _fetch_feed(feed)
+                            if not items:
+                                send("📡 הפיד ריק כרגע", chat_id=chat_id, user_id=user_id)
+                            else:
+                                items.sort(key=lambda x: x.get("updated_ts", 0.0))
+                                latest = items[-1]
+                                msg = _format_msg(latest)
+                                send("📡 הפריט האחרון מהפיד:\n" + msg, chat_id=chat_id, user_id=user_id)
+                    except Exception as e:
+                        send(f"❗ שגיאה ב-/last: {e}", chat_id=chat_id, user_id=user_id)
+
         except Exception:
             time.sleep(3)
 
