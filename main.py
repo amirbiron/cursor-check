@@ -16,7 +16,7 @@ SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # user id מספרי של�
 # פרמטרים לניטור (ניתן לשנות ב-ENV)
 SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))  # כל כמה שניות לדגום
 BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))          # מינ' הצלחות רצופות ל"חזר"
-BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))      # חלון יציבות (שניות)
+BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))      # חלון יציבות (שניות) ל"חזר" (ברירת מחדל 10 דק')
 DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))         # מינ' כשלונות רצופים ל"נפל"
 
 # ========= Reporter init =========
@@ -86,9 +86,9 @@ def check_site_ok() -> bool:
 
 def monitor_loop() -> None:
     """
-    'עלה' רק אם גם ה-AI וגם האתר OK (AND), וגם:
-      - רצף של BACK_SUCC_MIN הצלחות
-      - לאורך לפחות BACK_WINDOW_SEC שניות (חלון יציבות)
+    נחשב 'עלה' רק אם גם ה-AI וגם האתר OK (AND), וגם:
+      - יש רצף של BACK_SUCC_MIN הצלחות
+      - והן פרושות על לפחות BACK_WINDOW_SEC שניות (חלון יציבות)
     'נפל' רק אחרי DOWN_FAILS_MIN כשלונות רצופים.
     """
     global last_status, running
@@ -106,7 +106,7 @@ def monitor_loop() -> None:
             ok_both = ai_ok and web_ok
             now = time.time()
 
-            # היסטוריה לחלון זמן (למרות שהרצף הוא הקריטריון)
+            # היסטוריה לחלון זמן (למרות שהרצף הוא קריטריון עיקרי)
             history.append((now, ok_both))
             cutoff = now - BACK_WINDOW_SEC
             while history and history[0][0] < cutoff:
@@ -146,7 +146,7 @@ def monitor_loop() -> None:
 
 
 def polling_loop() -> None:
-    """פקודות טלגרם: /pause /resume /status /now"""
+    """פקודות טלגרם: /pause /resume /status"""
     global running
     offset = None
 
@@ -175,44 +175,33 @@ def polling_loop() -> None:
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
-            chat = msg.get("chat") or {}
-            chat_id = chat.get("id")
-            user = msg.get("from") or {}
-            user_id = str(user.get("id")) if user.get("id") else None
-            text = (msg.get("text") or "").strip()
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                user = msg.get("from") or {}
+                user_id = str(user.get("id")) if user.get("id") else None
+                text = (msg.get("text") or "").strip()
 
-            if reporter:
-                try:
-                    reporter.report_activity(user_id or (str(chat_id) if chat_id else None))
-                except Exception:
-                    pass
+                if reporter:
+                    try:
+                        reporter.report_activity(user_id or (str(chat_id) if chat_id else None))
+                    except Exception:
+                        pass
 
-            if text == "/pause":
-                running = False
-                send("⏸️ Monitoring paused", chat_id=chat_id, user_id=user_id)
-            elif text == "/resume":
-                running = True
-                send("▶️ Monitoring resumed", chat_id=chat_id, user_id=user_id)
-            elif text == "/status":
-                if last_status is None:
-                    send("ℹ️ No checks yet", chat_id=chat_id, user_id=user_id)
-                else:
-                    send(
-                        "✅ Responding" if last_status else "❌ Not responding",
-                        chat_id=chat_id,
-                        user_id=user_id,
-                    )
-            elif text == "/now":
-                ai_ok = check_cursor_ai()
-                web_ok = check_site_ok()
-                both = ai_ok and web_ok
-                msg_now = (
-                    "🔎 Now check\n"
-                    f"• AI:   {'OK' if ai_ok else 'DOWN'}\n"
-                    f"• Site: {'OK' if web_ok else 'DOWN'}\n"
-                    f"• AND:  {'OK' if both else 'DOWN'}"
-                )
-                send(msg_now, chat_id=chat_id, user_id=user_id)
+                if text == "/pause":
+                    running = False
+                    send("⏸️ Monitoring paused", chat_id=chat_id, user_id=user_id)
+                elif text == "/resume":
+                    running = True
+                    send("▶️ Monitoring resumed", chat_id=chat_id, user_id=user_id)
+                elif text == "/status":
+                    if last_status is None:
+                        send("ℹ️ No checks yet", chat_id=chat_id, user_id=user_id)
+                    else:
+                        send(
+                            "✅ Responding" if last_status else "❌ Not responding",
+                            chat_id=chat_id,
+                            user_id=user_id,
+                        )
         except Exception:
             time.sleep(3)
 
