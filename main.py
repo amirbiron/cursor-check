@@ -15,10 +15,14 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "Cursor-Check")
 SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # user id מספרי שלך
 
 # פרמטרים לניטור
-SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
-BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))
-BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))
-DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))
+SAMPLE_INTERVAL_SEC      = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
+DOWN_SAMPLE_INTERVAL_SEC = int(os.getenv("DOWN_SAMPLE_INTERVAL_SEC", "20"))
+BACK_SUCC_MIN            = int(os.getenv("BACK_SUCC_MIN", "2"))
+BACK_WINDOW_SEC          = int(os.getenv("BACK_WINDOW_SEC", "120"))
+DOWN_FAILS_MIN           = int(os.getenv("DOWN_FAILS_MIN", "3"))
+
+# בקרת מצב 'UP' – לפי AI בלבד כברירת מחדל (אפשר: ai|and|or|site)
+UP_MODE = os.getenv("UP_MODE", "ai").strip().lower()
 
 # ======== Status feed watcher (ENV) ========
 STATUS_FEED_URL    = os.getenv("STATUS_FEED_URL", "").strip()      # למשל: https://status.cursor.com/history.atom
@@ -63,18 +67,36 @@ def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> N
 
 
 def check_cursor_ai() -> bool:
-    """בודק שה-API של Cursor מחזיר 200 ויש גוף תשובה."""
+    """בדיקת בריאות מרוככת ל-AI: כל סטטוס שאינו 5xx נחשב UP (429 גם נחשב UP).
+
+    עדיף להשתמש ב-AI_HEALTH_URL אם הוגדר (למשל /health). אם לא, נבדוק את השורש.
+    כנפילה לרזרבה ננסה את קריאת ה-ChatService אך בלי לדרוש גוף תשובה.
+    """
     try:
-        r = requests.post(
-            "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
-            json={"messages": [{"role": "user", "content": "ping"}], "model": "gpt-4"},
-            timeout=12,
-        )
-        if r.status_code != 200:
-            return False
-        return len((r.text or "")) > 5
+        url = os.getenv("AI_HEALTH_URL", "https://api2.cursor.sh").strip()
+        # HEAD לבריאות, GET לשורש – עם עקיבה אחרי הפניות
+        if url.endswith("/health"):
+            r = requests.head(url, timeout=10, allow_redirects=True)
+        else:
+            r = requests.get(url, timeout=10, allow_redirects=True)
+        code = r.status_code
+        if code == 429:
+            return True
+        return code < 500
     except Exception:
-        return False
+        # ניסיון רזרבי על נקודת הצ'אט – נחשב כל קוד <500 או 429 כ-UP
+        try:
+            r = requests.post(
+                "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
+                json={"messages": [{"role": "user", "content": "ping"}], "model": "gpt-4"},
+                timeout=12,
+            )
+            code = r.status_code
+            if code == 429:
+                return True
+            return code < 500
+        except Exception:
+            return False
 
 
 def check_site_ok() -> bool:
@@ -104,10 +126,19 @@ def monitor_loop() -> None:
         if running:
             ai_ok = check_cursor_ai()
             web_ok = check_site_ok()
-            ok_both = ai_ok and web_ok
+
+            # קובע לפי מצב UP_MODE
+            if UP_MODE == "and":
+                ok_target = ai_ok and web_ok
+            elif UP_MODE == "or":
+                ok_target = ai_ok or web_ok
+            elif UP_MODE == "site":
+                ok_target = web_ok
+            else:  # "ai" (ברירת מחדל)
+                ok_target = ai_ok
             now = time.time()
 
-            if ok_both:
+            if ok_target:
                 if ok_streak == 0:
                     first_ok_ts = now
                 ok_streak += 1
@@ -119,7 +150,10 @@ def monitor_loop() -> None:
 
             # ❌ נפל: רצף כשלונות
             if last_status is not False and fail_streak >= DOWN_FAILS_MIN:
-                send(f"❌ Cursor down ({DOWN_FAILS_MIN}/{DOWN_FAILS_MIN} fails)", user_id="monitor")
+                send(
+                    f"❌ Cursor down ({DOWN_FAILS_MIN}/{DOWN_FAILS_MIN} fails) – rechecking every {DOWN_SAMPLE_INTERVAL_SEC}s",
+                    user_id="monitor",
+                )
                 last_status = False
 
             # ✅ חזר: רצף הצלחות + חלון זמן
@@ -130,13 +164,18 @@ def monitor_loop() -> None:
                 and (now - first_ok_ts) >= BACK_WINDOW_SEC
             ):
                 mins = BACK_WINDOW_SEC // 60
+                mode_label = {"ai": "AI", "and": "AI+Site", "or": "AI|Site", "site": "Site"}.get(UP_MODE, "AI")
                 send(
-                    f"✅ Cursor back ({ok_streak}/{BACK_SUCC_MIN} over ≥{mins}m, AND check)",
+                    f"✅ Cursor back ({ok_streak}/{BACK_SUCC_MIN} over ≥{mins}m, mode: {mode_label})",
                     user_id="monitor",
                 )
                 last_status = True
 
-        time.sleep(SAMPLE_INTERVAL_SEC)
+        # קצב דגימה מהיר יותר כשנמצאים ב-DOWN או בתהליך כשל
+        sleep_for = (
+            DOWN_SAMPLE_INTERVAL_SEC if (last_status is False or fail_streak > 0) else SAMPLE_INTERVAL_SEC
+        )
+        time.sleep(sleep_for)
 
 
 def polling_loop() -> None:
@@ -206,11 +245,24 @@ def polling_loop() -> None:
                     ai_ok = check_cursor_ai()
                     web_ok = check_site_ok()
                     both = ai_ok and web_ok
+                    if UP_MODE == "and":
+                        tgt = ai_ok and web_ok
+                        mode_label = "AI+Site"
+                    elif UP_MODE == "or":
+                        tgt = ai_ok or web_ok
+                        mode_label = "AI|Site"
+                    elif UP_MODE == "site":
+                        tgt = web_ok
+                        mode_label = "Site"
+                    else:
+                        tgt = ai_ok
+                        mode_label = "AI"
                     msg_now = (
                         "🔎 Now check\n"
                         f"• AI:   {'OK' if ai_ok else 'DOWN'}\n"
                         f"• Site: {'OK' if web_ok else 'DOWN'}\n"
-                        f"• AND:  {'OK' if both else 'DOWN'}"
+                        f"• AND:  {'OK' if both else 'DOWN'}\n"
+                        f"• Mode[{mode_label}]: {'OK' if tgt else 'DOWN'}"
                     )
                     send(msg_now, chat_id=chat_id, user_id=user_id)
 
