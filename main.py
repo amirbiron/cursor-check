@@ -4,6 +4,7 @@ import threading
 from collections import deque
 import requests
 from activity_reporter import create_reporter
+from status_watcher import start_status_watcher  # ← NEW
 
 # ========= ENV =========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -11,13 +12,18 @@ CHAT_ID = os.getenv("CHAT_ID")
 MONGODB_URI = os.getenv("MONGODB_URI")
 SERVICE_ID = os.getenv("SERVICE_ID", "srv-unknown")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Cursor-Check")
-SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")
+SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # user id מספרי שלך
 
-# פרמטרים לניטור
-SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
-BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))
-BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))
-DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))
+# פרמטרים לניטור (ניתן לשנות ב-ENV)
+SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))  # כל כמה שניות לדגום
+BACK_SUCC_MIN      = int(os.getenv("BACK_SUCC_MIN", "6"))          # מינ' הצלחות רצופות ל"חזר"
+BACK_WINDOW_SEC    = int(os.getenv("BACK_WINDOW_SEC", "600"))      # חלון יציבות ל"חזר" (שניות)
+DOWN_FAILS_MIN     = int(os.getenv("DOWN_FAILS_MIN", "3"))         # מינ' כשלונות רצופים ל"נפל"
+
+# ======== Status feed watcher (ENV) ========
+STATUS_FEED_URL    = os.getenv("STATUS_FEED_URL", "").strip()      # למשל: https://status.cursor.com/history.atom
+STATUS_POLL_SEC    = int(os.getenv("STATUS_POLL_SEC", "180"))
+STATUS_STATE_PATH  = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
 
 # ========= Reporter init =========
 reporter = None
@@ -33,10 +39,11 @@ else:
     print("ℹ️ MONGODB_URI not set – activity reporting disabled", flush=True)
 
 last_status = None
-running = True
+running = True  # נשלט ע״י /pause ו-/resume
 
 
 def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> None:
+    """שליחת הודעה לטלגרם + דיווח activity (best-effort)."""
     target = chat_id or CHAT_ID
     if not TOKEN or not target:
         return
@@ -56,6 +63,7 @@ def send(text: str, chat_id: str | None = None, user_id: str | None = None) -> N
 
 
 def check_cursor_ai() -> bool:
+    """בודק שה-API של Cursor מחזיר 200 וגם יש תוכן; לא סופר 200 ריק."""
     try:
         r = requests.post(
             "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
@@ -64,12 +72,14 @@ def check_cursor_ai() -> bool:
         )
         if r.status_code != 200:
             return False
-        return len((r.text or "")) > 5
+        body = (r.text or "")
+        return len(body) > 5
     except Exception:
         return False
 
 
 def check_site_ok() -> bool:
+    """אתר חי = 200 (מרוכך כדי לא לסמן DOWN על placeholder)."""
     try:
         r = requests.get("https://cursor.sh", timeout=10)
         return r.status_code == 200
@@ -78,6 +88,12 @@ def check_site_ok() -> bool:
 
 
 def monitor_loop() -> None:
+    """
+    'עלה' רק אם גם ה-AI וגם האתר OK (AND), וגם:
+      - רצף של BACK_SUCC_MIN הצלחות
+      - לאורך לפחות BACK_WINDOW_SEC שניות (חלון יציבות)
+    'נפל' רק אחרי DOWN_FAILS_MIN כשלונות רצופים.
+    """
     global last_status, running
     send("🤖 cursor-monitor started", user_id="monitor")
 
@@ -102,10 +118,12 @@ def monitor_loop() -> None:
                 first_ok_ts = None
                 fail_streak += 1
 
+            # ❌ נפל: רצף כשלונות
             if last_status is not False and fail_streak >= DOWN_FAILS_MIN:
                 send(f"❌ Cursor down ({DOWN_FAILS_MIN}/{DOWN_FAILS_MIN} fails)", user_id="monitor")
                 last_status = False
 
+            # ✅ חזר: רצף הצלחות + חלון זמן
             if (
                 last_status is not True
                 and ok_streak >= BACK_SUCC_MIN
@@ -123,9 +141,11 @@ def monitor_loop() -> None:
 
 
 def polling_loop() -> None:
+    """פקודות טלגרם: /pause /resume /status /now"""
     global running
     offset = None
 
+    # מנקה webhook כדי ש-getUpdates יעבוד
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
@@ -148,7 +168,7 @@ def polling_loop() -> None:
                 continue
 
             for upd in data.get("result", []):
-                # 🔑 חשוב: לשרוף את ה-update כדי שלא יחזור שוב
+                # חשוב: לשרוף את ה-update כדי שלא יחזור שוב
                 offset = upd["update_id"] + 1
 
                 msg = upd.get("message") or {}
@@ -195,12 +215,25 @@ def polling_loop() -> None:
 
 
 if __name__ == "__main__":
+    # דיווח פתיחה כדי שבוט ההשעיה יזהה מיידית
     if reporter and SUSPENSION_USER_ID:
         try:
             reporter.report_activity(SUSPENSION_USER_ID)
         except Exception:
             pass
 
+    # 🔭 מפעילים צופה סטטוס רשמי (אם הוגדר feed)
+    def _send_status_to_telegram(text: str) -> None:
+        send(f"📡 Status feed\n{text}", user_id="status-feed")
+
+    start_status_watcher(
+        STATUS_FEED_URL or None,
+        STATUS_POLL_SEC,
+        STATUS_STATE_PATH,
+        _send_status_to_telegram,
+    )
+
+    # מריץ ניטור + קליטת פקודות במקביל
     threading.Thread(target=monitor_loop, daemon=True).start()
     print("👂 polling_loop started", flush=True)
     polling_loop()
