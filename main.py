@@ -11,6 +11,9 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 SERVICE_ID = os.getenv("SERVICE_ID", "srv-d2sbg924d50c73as1ku0")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Cursor-Check")
 
+# משתמש טלגרם מספרי לזיהוי מיידי על Boot (לקבל מ-@userinfobot)
+SUSPENSION_USER_ID = os.getenv("SUSPENSION_USER_ID")  # למשל: "123456789"
+
 # reporter
 reporter = None
 if MONGODB_URI:
@@ -33,25 +36,21 @@ def send(text: str, chat_id: str = None, user_id: str | None = None):
     """שליחת הודעה לטלגרם + דיווח פעילות (אם אפשר)."""
     target = chat_id or CHAT_ID
     if not TOKEN or not target:
-        print("❗ Missing TELEGRAM_BOT_TOKEN or chat_id")
         return
     try:
-        resp = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": target, "text": text},
             timeout=10,
         )
-        if resp.status_code != 200:
-            print(f"❗ Telegram send failed: {resp.status_code} {resp.text}")
-        else:
-            print(f"✅ Sent: {text}")
-            if reporter and user_id:
-                try:
-                    reporter.report_activity(user_id)
-                except Exception as e:
-                    print(f"❗ reporter.report_activity error: {e}")
-    except Exception as e:
-        print(f"❗ Telegram exception: {e}")
+        # דיווח פעילות: נעדיף user_id מההודעה; אם אין—נשתמש ב-SUSPENSION_USER_ID
+        if reporter:
+            try:
+                reporter.report_activity(user_id or SUSPENSION_USER_ID)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def check_cursor_ai() -> bool:
     """בודק אם ה-AI של Cursor מגיב (סטטוס 200)."""
@@ -61,10 +60,8 @@ def check_cursor_ai() -> bool:
             json={"messages": [{"role": "user", "content": "ping"}], "model": "gpt-4"},
             timeout=10,
         )
-        print(f"ℹ️ Cursor AI check -> {r.status_code}")
         return r.status_code == 200
-    except Exception as e:
-        print(f"❗ Cursor AI check exception: {e}")
+    except Exception:
         return False
 
 def monitor_loop():
@@ -108,12 +105,12 @@ def polling_loop():
                 user_id = str(user.get("id")) if user.get("id") else None
                 text = (msg.get("text") or "").strip()
 
-                # דיווח פעילות על כל הודעה נכנסת
-                if reporter and user_id:
+                # דיווח פעילות על כל הודעה נכנסת (אם אין user_id—נשתמש ב-chat_id או ב-SUSPENSION_USER_ID)
+                if reporter:
                     try:
-                        reporter.report_activity(user_id)
-                    except Exception as e:
-                        print(f"❗ reporter.report_activity error: {e}")
+                        reporter.report_activity(user_id or str(chat_id) if chat_id else SUSPENSION_USER_ID)
+                    except Exception:
+                        pass
 
                 if text == "/pause":
                     running = False
@@ -125,11 +122,17 @@ def polling_loop():
                     send(("✅ Responding" if last_status else "❌ Not responding")
                          if last_status is not None else "ℹ️ No checks yet",
                          chat_id=chat_id, user_id=user_id)
-        except Exception as e:
-            print(f"❗ polling error: {e}")
+        except Exception:
             time.sleep(3)
 
 if __name__ == "__main__":
+    # דיווח פעילות מיידי על עלייה – כדי שבוט ההשעיה יזהה גם בלי פקודה
+    if reporter and SUSPENSION_USER_ID:
+        try:
+            reporter.report_activity(SUSPENSION_USER_ID)
+        except Exception:
+            pass
+
     # מריצים ניטור + קליטת פקודות במקביל (Worker, בלי webhook)
     threading.Thread(target=monitor_loop, daemon=True).start()
     polling_loop()
