@@ -6,20 +6,73 @@ from typing import Callable, Dict, Any, List, Optional
 import requests
 import xml.etree.ElementTree as ET
 
-
-# ---- הגדרות מ־ENV (אפשר גם מהקובץ הקורא) ----
-DEFAULT_FEED_URL = os.getenv("STATUS_FEED_URL", "").strip()  # לדוגמה: https://status.cursor.com/history.atom או .rss
-POLL_SEC = int(os.getenv("STATUS_POLL_SEC", "180"))          # כל כמה שניות לבדוק פיד (דיפולט: 3 דק')
+# ========= ENV / Defaults =========
+DEFAULT_FEED_URL = os.getenv("STATUS_FEED_URL", "").strip()   # למשל https://status.cursor.com/history.atom
+POLL_SEC = int(os.getenv("STATUS_POLL_SEC", "180"))          # מרווח בדיקות (שניות)
 STATE_PATH = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
 
+ONLY_INCIDENTLIKE = os.getenv("STATUS_ONLY_INCIDENTS", "true").lower() == "true"
+SKIP_ANALYTICS    = os.getenv("STATUS_SKIP_ANALYTICS", "true").lower() == "true"
+MAX_PER_POLL      = int(os.getenv("STATUS_MAX_PER_POLL", "2"))
+COOLDOWN_SEC      = int(os.getenv("STATUS_COOLDOWN_SEC", "900"))  # 15 דק׳
+BOOT_IGNORE_HISTORY = os.getenv("STATUS_BOOT_IGNORE_HISTORY", "true").lower() == "true"
 
-def _norm_text(s: Optional[str]) -> str:
+STATUS_HEBREW = os.getenv("STATUS_HEBREW", "true").lower() == "true"
+LOCAL_TZ = os.getenv("STATUS_TZ", "Asia/Jerusalem")
+
+BOOT_TS = time.time()
+
+# ========= utils =========
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+WS_RE = re.compile(r"\s+")
+
+def _strip_html(s: str) -> str:
+    s = _HTML_TAG_RE.sub(" ", s or "")
+    s = WS_RE.sub(" ", s).strip()
+    return s
+
+def _norm(s: Optional[str]) -> str:
     return (s or "").strip()
 
-
 def _get_text(elem: Optional[ET.Element]) -> str:
-    return _norm_text(elem.text if elem is not None else "")
+    return _norm(elem.text if elem is not None else "")
 
+def _parse_time_guess(s: str) -> float:
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(s).timestamp()
+    except Exception:
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return time.time()
+
+def _fmt_local(ts: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        dt = _dt.datetime.fromtimestamp(ts, ZoneInfo(LOCAL_TZ))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+def _classify(title: str, body: str) -> str:
+    t = f"{title} {body}".lower()
+    if re.search(r"\b(resolved|fixed|restored|monitoring)\b", t):
+        return "resolved"
+    if re.search(r"\b(investigating|degraded|degradation|partial outage|incident|outage)\b", t):
+        return "incident"
+    if re.search(r"\b(identified|mitigating|recovering|update)\b", t):
+        return "update"
+    return "other"
+
+def _is_analytics(title: str, body: str) -> bool:
+    t = f"{title} {body}".lower()
+    return "analytic" in t
+
+# ========= feed parsing =========
 
 def _parse_atom(root: ET.Element) -> List[Dict[str, Any]]:
     ns = {"a": "http://www.w3.org/2005/Atom"}
@@ -31,22 +84,22 @@ def _parse_atom(root: ET.Element) -> List[Dict[str, Any]]:
         link = ""
         link_el = entry.find("a:link", ns)
         if link_el is not None:
-            link = link_el.get("href", "")
+            link = (link_el.get("href") or "").strip()
         summary = _get_text(entry.find("a:summary", ns))
-        # לפעמים יש תוכן ולא סיכום
         content_el = entry.find("a:content", ns)
         content = _get_text(content_el) if content_el is not None else ""
+        body = _strip_html(summary or content)
         items.append(
             {
                 "id": entry_id or f"{title}|{updated}",
                 "title": title,
                 "updated": updated,
+                "updated_ts": _parse_time_guess(updated),
                 "link": link,
-                "summary": summary or content,
+                "summary": body,
             }
         )
     return items
-
 
 def _parse_rss(root: ET.Element) -> List[Dict[str, Any]]:
     items = []
@@ -56,26 +109,36 @@ def _parse_rss(root: ET.Element) -> List[Dict[str, Any]]:
         title = _get_text(item.find("title"))
         pub = _get_text(item.find("pubDate")) or _get_text(item.find("date"))
         link = _get_text(item.find("link"))
-        desc = _get_text(item.find("description"))
+        desc = _strip_html(_get_text(item.find("description")))
         items.append(
             {
                 "id": guid or f"{title}|{pub}",
                 "title": title,
                 "updated": pub,
+                "updated_ts": _parse_time_guess(pub),
                 "link": link,
                 "summary": desc,
             }
         )
     return items
 
+def _fetch_feed(feed_url: str) -> List[Dict[str, Any]]:
+    r = requests.get(feed_url, timeout=12)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    tag = root.tag.lower()
+    if "feed" in tag:
+        return _parse_atom(root)
+    return _parse_rss(root)
+
+# ========= state =========
 
 def _load_state(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"last_ids": []}  # נשמור עד 50 אחרונים
-
+        return {"last_ids": [], "last_sent_ts": 0.0}
 
 def _save_state(path: str, state: Dict[str, Any]) -> None:
     try:
@@ -84,77 +147,100 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
-def _classify(title: str, body: str) -> str:
-    """מנסה לשים אייקון לפי מילים נפוצות."""
-    t = f"{title} {body}".lower()
-    if re.search(r"\b(resolved|fixed|restored|monitoring)\b", t):
-        return "✅ Resolved"
-    if re.search(r"\b(investigating|degraded|degradation|partial outage|incident)\b", t):
-        return "🚨 Incident"
-    if re.search(r"\b(identified|mitigating|recovering)\b", t):
-        return "🛠️ Mitigating"
-    return "🔔 Update"
-
+# ========= core =========
 
 def _format_msg(item: Dict[str, Any]) -> str:
     title = item.get("title") or ""
     when = item.get("updated") or ""
+    when_ts = float(item.get("updated_ts") or _parse_time_guess(when))
     link = item.get("link") or ""
     summary = item.get("summary") or ""
-    label = _classify(title, summary)
-    # חיתוך תקציר למובייל
-    short = summary.strip().replace("\n", " ")
+    typ = _classify(title, summary)
+
+    if STATUS_HEBREW:
+        icon_map = {"resolved": "✅ נפתר", "incident": "🚨 תקלה", "update": "🔔 עדכון"}
+        icon = icon_map.get(typ, "🔔 עדכון")
+        short = summary.strip()
+        if len(short) > 280:
+            short = short[:277] + "..."
+        local = _fmt_local(when_ts)
+        parts = [
+            f"{icon}: {title}",
+            f"🕒 {local} ({LOCAL_TZ})",
+            f"🔗 {link}" if link else "",
+            f"— {short}" if short else "",
+        ]
+        return "\n".join([p for p in parts if p])
+
+    # default English
+    icon = {"resolved": "✅ Resolved", "incident": "🚨 Incident", "update": "🔔 Update"}.get(typ, "🔔 Update")
+    short = summary.strip()
     if len(short) > 280:
         short = short[:277] + "..."
     parts = [
-        f"{label}: {title}",
+        f"{icon}: {title}",
         f"🕒 {when}" if when else "",
         f"🔗 {link}" if link else "",
         f"— {short}" if short else "",
     ]
     return "\n".join([p for p in parts if p])
 
-
-def _fetch_feed(feed_url: str) -> List[Dict[str, Any]]:
-    r = requests.get(feed_url, timeout=12)
-    r.raise_for_status()
-    # ננסה לזהות אטום/‏RSS לפי root tag
-    root = ET.fromstring(r.text)
-    tag = root.tag.lower()
-    if "feed" in tag:   # atom
-        return _parse_atom(root)
-    return _parse_rss(root)  # rss
-
+def _should_send(item: Dict[str, Any]) -> bool:
+    title = item.get("title") or ""
+    body = item.get("summary") or ""
+    typ = _classify(title, body)
+    if ONLY_INCIDENTLIKE and typ not in ("incident", "resolved"):
+        return False
+    if SKIP_ANALYTICS and _is_analytics(title, body):
+        return False
+    return True
 
 def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], None]) -> Dict[str, Any]:
     last_ids: List[str] = list(state.get("last_ids", []))
+    last_sent_ts: float = float(state.get("last_sent_ts", 0.0))
+    now = time.time()
+
     items = _fetch_feed(feed_url)
-    # newest first אם אפשר (לפי סדר הופעה)
-    new_msgs = []
+
+    fresh: List[Dict[str, Any]] = []
     for it in items:
-        _id = it.get("id") or ""
-        if not _id:
+        it_id = it.get("id") or ""
+        if not it_id:
             continue
-        if _id in last_ids:
+        if it_id in last_ids:
             continue
-        new_msgs.append(_format_msg(it))
-        last_ids.append(_id)
+        if BOOT_IGNORE_HISTORY and it.get("updated_ts", now) < BOOT_TS:
+            continue
+        if not _should_send(it):
+            last_ids.append(it_id)
+            continue
+        fresh.append(it)
 
-    # גבול לרשימת ה־ids
-    if len(last_ids) > 50:
-        last_ids = last_ids[-50:]
+    fresh.sort(key=lambda x: x.get("updated_ts", now))
 
-    # שליחת הודעות בסדר מהישן לחדש כדי לא לבלגן כרונולוגיה
-    for msg in reversed(new_msgs):
+    sent = 0
+    for it in fresh:
+        if sent >= MAX_PER_POLL:
+            break
+        if COOLDOWN_SEC > 0 and (now - last_sent_ts) < COOLDOWN_SEC:
+            break
         try:
-            on_event(msg)
+            on_event(_format_msg(it))
+            last_sent_ts = now
+            sent += 1
         except Exception:
             pass
+        finally:
+            _id = it.get("id")
+            if _id:
+                last_ids.append(_id)
+
+    if len(last_ids) > 100:
+        last_ids = last_ids[-100:]
 
     state["last_ids"] = last_ids
+    state["last_sent_ts"] = last_sent_ts
     return state
-
 
 def start_status_watcher(
     feed_url: Optional[str],
@@ -162,9 +248,6 @@ def start_status_watcher(
     state_path: Optional[str],
     send_fn: Callable[[str], None],
 ) -> None:
-    """
-    מריץ לולאה בחוט נפרד: מושך פיד סטטוס כל poll_sec שניות, שולח עדכונים חדשים.
-    """
     url = (feed_url or DEFAULT_FEED_URL).strip()
     if not url:
         print("ℹ️ STATUS_FEED_URL not set – skipping status watcher", flush=True)
@@ -175,7 +258,12 @@ def start_status_watcher(
 
     def _run():
         st = _load_state(path)
-        print(f"🔭 status watcher started (feed={url}, every {interval}s)", flush=True)
+        print(
+            f"🔭 status watcher started feed={url}, poll={interval}s, "
+            f"only_incidents={ONLY_INCIDENTLIKE}, skip_analytics={SKIP_ANALYTICS}, "
+            f"cooldown={COOLDOWN_SEC}s, max_per_poll={MAX_PER_POLL}, boot_ignore_history={BOOT_IGNORE_HISTORY}, hebrew={STATUS_HEBREW}",
+            flush=True,
+        )
         while True:
             try:
                 st = watch_once(url, st, send_fn)
@@ -185,5 +273,4 @@ def start_status_watcher(
             time.sleep(interval)
 
     import threading as _t
-
     _t.Thread(target=_run, daemon=True).start()
