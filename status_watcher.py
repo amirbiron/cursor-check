@@ -1,3 +1,6 @@
+# status_watcher.py
+# Watch Cursor (or any Statuspage-style) RSS/Atom feed and push concise Hebrew updates.
+
 import os
 import time
 import json
@@ -6,37 +9,43 @@ from typing import Callable, Dict, Any, List, Optional
 import requests
 import xml.etree.ElementTree as ET
 
-# ========= ENV / Defaults =========
-DEFAULT_FEED_URL = os.getenv("STATUS_FEED_URL", "").strip()   # למשל https://status.cursor.com/history.atom
-POLL_SEC = int(os.getenv("STATUS_POLL_SEC", "180"))          # מרווח בדיקות (שניות)
-STATE_PATH = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
+# ===== ENV & Defaults =====
+DEFAULT_FEED_URL = os.getenv("STATUS_FEED_URL", "").strip()
+POLL_SEC         = int(os.getenv("STATUS_POLL_SEC", "180"))
+STATE_PATH       = os.getenv("STATUS_STATE_PATH", "/tmp/status_feed_state.json")
 
-ONLY_INCIDENTLIKE = os.getenv("STATUS_ONLY_INCIDENTS", "true").lower() == "true"
-SKIP_ANALYTICS    = os.getenv("STATUS_SKIP_ANALYTICS", "true").lower() == "true"
-MAX_PER_POLL      = int(os.getenv("STATUS_MAX_PER_POLL", "2"))
-COOLDOWN_SEC      = int(os.getenv("STATUS_COOLDOWN_SEC", "900"))  # 15 דק׳
-BOOT_IGNORE_HISTORY = os.getenv("STATUS_BOOT_IGNORE_HISTORY", "true").lower() == "true"
+ONLY_INCIDENTLIKE    = os.getenv("STATUS_ONLY_INCIDENTS", "true").lower() == "true"
+SKIP_ANALYTICS       = os.getenv("STATUS_SKIP_ANALYTICS", "true").lower() == "true"
+MAX_PER_POLL         = int(os.getenv("STATUS_MAX_PER_POLL", "2"))
+COOLDOWN_SEC         = int(os.getenv("STATUS_COOLDOWN_SEC", "900"))
+BOOT_IGNORE_HISTORY  = os.getenv("STATUS_BOOT_IGNORE_HISTORY", "true").lower() == "true"
+SEND_LAST_ON_BOOT    = os.getenv("STATUS_SEND_LAST_ON_BOOT", "true").lower() == "true"
 
-STATUS_HEBREW = os.getenv("STATUS_HEBREW", "true").lower() == "true"
-LOCAL_TZ = os.getenv("STATUS_TZ", "Asia/Jerusalem")
+# תצוגה בעברית – קצר וברור
+STATUS_HEBREW        = os.getenv("STATUS_HEBREW", "true").lower() == "true"
+STATUS_TZ            = os.getenv("STATUS_TZ", "Asia/Jerusalem")
+# לכל מקרה שתרצה כן לכלול תקציר טקסט חופשי:
+STATUS_INCLUDE_SUMMARY = os.getenv("STATUS_INCLUDE_SUMMARY", "false").lower() == "true"
 
 BOOT_TS = time.time()
 
-# ========= utils =========
-
+# ===== Utils =====
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-WS_RE = re.compile(r"\s+")
+WS_RE        = re.compile(r"\s+")
+
 
 def _strip_html(s: str) -> str:
     s = _HTML_TAG_RE.sub(" ", s or "")
-    s = WS_RE.sub(" ", s).strip()
-    return s
+    return WS_RE.sub(" ", s).strip()
+
 
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip()
 
+
 def _get_text(elem: Optional[ET.Element]) -> str:
     return _norm(elem.text if elem is not None else "")
+
 
 def _parse_time_guess(s: str) -> float:
     try:
@@ -49,31 +58,36 @@ def _parse_time_guess(s: str) -> float:
         except Exception:
             return time.time()
 
+
 def _fmt_local(ts: float) -> str:
     try:
         from zoneinfo import ZoneInfo
         import datetime as _dt
-        dt = _dt.datetime.fromtimestamp(ts, ZoneInfo(LOCAL_TZ))
+        dt = _dt.datetime.fromtimestamp(ts, ZoneInfo(STATUS_TZ))
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
+
 def _classify(title: str, body: str) -> str:
     t = f"{title} {body}".lower()
-    if re.search(r"\b(resolved|fixed|restored|monitoring)\b", t):
+    if re.search(r"\b(resolved|fixed|restored)\b", t):
         return "resolved"
+    if re.search(r"\b(monitoring|observing)\b", t):
+        return "monitoring"
     if re.search(r"\b(investigating|degraded|degradation|partial outage|incident|outage)\b", t):
         return "incident"
     if re.search(r"\b(identified|mitigating|recovering|update)\b", t):
         return "update"
     return "other"
 
+
 def _is_analytics(title: str, body: str) -> bool:
     t = f"{title} {body}".lower()
-    return "analytic" in t
+    return "analytic" in t  # analytics / analytic
 
-# ========= feed parsing =========
 
+# ===== Feed parsing =====
 def _parse_atom(root: ET.Element) -> List[Dict[str, Any]]:
     ns = {"a": "http://www.w3.org/2005/Atom"}
     items = []
@@ -101,6 +115,7 @@ def _parse_atom(root: ET.Element) -> List[Dict[str, Any]]:
         )
     return items
 
+
 def _parse_rss(root: ET.Element) -> List[Dict[str, Any]]:
     items = []
     for item in root.findall(".//item"):
@@ -122,23 +137,25 @@ def _parse_rss(root: ET.Element) -> List[Dict[str, Any]]:
         )
     return items
 
+
 def _fetch_feed(feed_url: str) -> List[Dict[str, Any]]:
     r = requests.get(feed_url, timeout=12)
     r.raise_for_status()
     root = ET.fromstring(r.text)
     tag = root.tag.lower()
-    if "feed" in tag:
+    if "feed" in tag:  # Atom
         return _parse_atom(root)
-    return _parse_rss(root)
+    return _parse_rss(root)  # RSS
 
-# ========= state =========
 
+# ===== State =====
 def _load_state(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"last_ids": [], "last_sent_ts": 0.0}
+        return {"last_ids": [], "last_sent_ts": 0.0, "boot_sent": False}
+
 
 def _save_state(path: str, state: Dict[str, Any]) -> None:
     try:
@@ -147,60 +164,110 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# ========= core =========
 
+# ===== Formatting (Hebrew concise) =====
 def _format_msg(item: Dict[str, Any]) -> str:
     title = item.get("title") or ""
     when = item.get("updated") or ""
     when_ts = float(item.get("updated_ts") or _parse_time_guess(when))
     link = item.get("link") or ""
     summary = item.get("summary") or ""
+
     typ = _classify(title, summary)
 
     if STATUS_HEBREW:
-        icon_map = {"resolved": "✅ נפתר", "incident": "🚨 תקלה", "update": "🔔 עדכון"}
-        icon = icon_map.get(typ, "🔔 עדכון")
-        short = summary.strip()
-        if len(short) > 280:
-            short = short[:277] + "..."
+        # תוויות קצרות בעברית
+        label_map = {
+            "resolved":   "✅ התקלה נפתרה",
+            "monitoring": "🟡 במעקב",
+            "incident":   "🔴 נחקרת תקלה",
+            "update":     "🔔 עדכון",
+            "other":      "🔔 עדכון",
+        }
+        label = label_map.get(typ, "🔔 עדכון")
         local = _fmt_local(when_ts)
+
         parts = [
-            f"{icon}: {title}",
-            f"🕒 {local} ({LOCAL_TZ})",
+            "📡 עדכון סטטוס:",
+            f"{label}: {title}".strip(),
+            f"🕒 {local} ({STATUS_TZ})",
             f"🔗 {link}" if link else "",
-            f"— {short}" if short else "",
         ]
+        if STATUS_INCLUDE_SUMMARY and summary:
+            # אופציונלי – אם תרצה גם שורה קצרה מתוכן ההודעה
+            short = summary.strip()
+            if len(short) > 240:
+                short = short[:237] + "..."
+            parts.append(f"— {short}")
         return "\n".join([p for p in parts if p])
 
-    # default English
-    icon = {"resolved": "✅ Resolved", "incident": "🚨 Incident", "update": "🔔 Update"}.get(typ, "🔔 Update")
-    short = summary.strip()
-    if len(short) > 280:
-        short = short[:277] + "..."
+    # ברירת מחדל: אנגלית קצרה
+    icon_map = {
+        "resolved": "✅ Resolved",
+        "monitoring": "🟡 Monitoring",
+        "incident": "🔴 Incident",
+        "update": "🔔 Update",
+    }
+    icon = icon_map.get(typ, "🔔 Update")
     parts = [
+        "📡 Status update:",
         f"{icon}: {title}",
         f"🕒 {when}" if when else "",
         f"🔗 {link}" if link else "",
-        f"— {short}" if short else "",
     ]
+    if STATUS_INCLUDE_SUMMARY and summary:
+        short = summary.strip()
+        if len(short) > 240:
+            short = short[:237] + "..."
+        parts.append(f"— {short}")
     return "\n".join([p for p in parts if p])
+
 
 def _should_send(item: Dict[str, Any]) -> bool:
     title = item.get("title") or ""
     body = item.get("summary") or ""
     typ = _classify(title, body)
-    if ONLY_INCIDENTLIKE and typ not in ("incident", "resolved"):
+    if ONLY_INCIDENTLIKE and typ not in ("incident", "resolved", "monitoring"):
         return False
     if SKIP_ANALYTICS and _is_analytics(title, body):
         return False
     return True
 
+
+def _pick_latest_allowed(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    allowed = [it for it in items if _should_send(it)]
+    if not allowed:
+        return None
+    allowed.sort(key=lambda x: x.get("updated_ts", 0.0))
+    return allowed[-1]
+
+
+# ===== Core =====
 def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], None]) -> Dict[str, Any]:
     last_ids: List[str] = list(state.get("last_ids", []))
     last_sent_ts: float = float(state.get("last_sent_ts", 0.0))
+    boot_sent: bool = bool(state.get("boot_sent", False))
     now = time.time()
 
     items = _fetch_feed(feed_url)
+
+    # שליחה חד-פעמית על Boot (פריט אחרון שעובר מסננים; אם אין – לא שולח)
+    if SEND_LAST_ON_BOOT and not boot_sent:
+        latest = _pick_latest_allowed(items)
+        if latest:
+            try:
+                on_event(_format_msg(latest))
+            except Exception:
+                pass
+        # מסמנים את כולם כנצפו כדי שלא להציף אחר-כך
+        for it in items:
+            _id = it.get("id")
+            if _id and _id not in last_ids:
+                last_ids.append(_id)
+        state["last_sent_ts"] = now  # לא מגביל ע"י cooldown על הודעת boot
+        state["boot_sent"] = True
+        state["last_ids"] = last_ids
+        return state
 
     fresh: List[Dict[str, Any]] = []
     for it in items:
@@ -209,7 +276,9 @@ def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], N
             continue
         if it_id in last_ids:
             continue
+        # מתעלמים מהיסטוריה לפני העלייה אם ביקשת
         if BOOT_IGNORE_HISTORY and it.get("updated_ts", now) < BOOT_TS:
+            last_ids.append(it_id)
             continue
         if not _should_send(it):
             last_ids.append(it_id)
@@ -235,12 +304,13 @@ def watch_once(feed_url: str, state: Dict[str, Any], on_event: Callable[[str], N
             if _id:
                 last_ids.append(_id)
 
-    if len(last_ids) > 100:
-        last_ids = last_ids[-100:]
+    if len(last_ids) > 200:
+        last_ids = last_ids[-200:]
 
     state["last_ids"] = last_ids
     state["last_sent_ts"] = last_sent_ts
     return state
+
 
 def start_status_watcher(
     feed_url: Optional[str],
@@ -261,7 +331,9 @@ def start_status_watcher(
         print(
             f"🔭 status watcher started feed={url}, poll={interval}s, "
             f"only_incidents={ONLY_INCIDENTLIKE}, skip_analytics={SKIP_ANALYTICS}, "
-            f"cooldown={COOLDOWN_SEC}s, max_per_poll={MAX_PER_POLL}, boot_ignore_history={BOOT_IGNORE_HISTORY}, hebrew={STATUS_HEBREW}",
+            f"cooldown={COOLDOWN_SEC}s, max_per_poll={MAX_PER_POLL}, "
+            f"boot_ignore_history={BOOT_IGNORE_HISTORY}, send_last_on_boot={SEND_LAST_ON_BOOT}, "
+            f"hebrew={STATUS_HEBREW}, include_summary={STATUS_INCLUDE_SUMMARY}",
             flush=True,
         )
         while True:
